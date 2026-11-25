@@ -13,7 +13,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { discover, listGitFiles, explainGitError, gitInfo, classify, themeRoots, toPosix, parseArgs, fmtNum, HARD_IGNORE_DIRS, MAP_DIR, LEGACY_MAP_DIR, isMapDir, mapDir, keepOutOfGit, unattendedMode, printJson, skippedConfigs, MAX_CONFIG_BYTES, readJsonFile, notMapped } from './lib/common.mjs';
 import { extract, callableCallsVia, phpPages } from './lib/extract.mjs';
-import { findIssues } from './lib/health.mjs';
+import { findIssues, maskSecrets, looksGenerated } from './lib/health.mjs';
 import { findScreens } from './lib/screens.mjs';
 import { createResolver, applyGlobalUsings } from './lib/resolve.mjs';
 import { resolveRoutes, matchCalls, matchWayfinder, inertiaLinks } from './lib/routes.mjs';
@@ -187,7 +187,8 @@ const serverless = serverlessRoutes(files, (p) => { try { return fs.readFileSync
 routes.push(...serverless.routes);
 // Supabase Edge Functions: each one's address under /functions/v1 (lib/supabase-functions.mjs)
 const edge = edgeFunctionRoutes(files, routes, (p) => { try { return fs.readFileSync(path.join(root, p), 'utf8'); } catch { return ''; } });
-const http = matchCalls(files, routes);
+const reached = new Map();
+const http = matchCalls(files, routes, reached);
 // Laravel: Wayfinder's named routes and controller actions, and the Inertia page each endpoint opens
 const wayfinderLinks = matchWayfinder(files, routes, (p) => { try { return fs.readFileSync(path.join(root, p), 'utf8'); } catch { return ''; } });
 const inertia = inertiaLinks(files, routes);
@@ -195,7 +196,28 @@ http.push(...wayfinderLinks, ...inertia.http);
 const fileAt = new Map(files.map((f) => [f.path, f]));
 for (const { file, hint } of inertia.hints) { const f = fileAt.get(file); if (f) f.screens = [...(f.screens || []), hint]; }
 const hosts = [];
-for (const f of files) for (const h of f.hosts || []) hosts.push({ from: f.path, host: h.host, line: h.line });
+for (const f of files) for (const h of f.hosts || []) hosts.push({ from: f.path, host: h.host, line: h.line, ...(h.retrofit ? { retrofit: true } : {}) });
+// Retrofit requests no route in the scanned code fits, which go to the server behind the client's base URL or to the
+// full address written in the annotation; build.mjs puts
+// them on an http edge to an external node. Only Retrofit: elsewhere the call reader also reads route definitions
+// (Ktor's get("/users") { }), and a relative address goes to the page's own server.
+// A request some route fits only loosely (matchCalls dropped it) is kept as `loose`, counted but on no edge.
+// The path is masked a segment at a time, since a token in a request address would otherwise be stored here as written.
+// When the whole path looks secret (a webhook's ids), its generated looking segments are hidden too, or the whole path
+// when no segment was; `hidden` says it was
+const unmatchedCalls = [];
+for (const f of files) for (const c of f.calls || []) {
+  // a Firebase function no scanned function answers is left out, as the generic reader leaves it out
+  if (!c.retrofit || c.firebase || reached.get(c) === true) continue;
+  let p = c.path.split('/').map((s) => maskSecrets(s)).join('/');
+  if (maskSecrets(c.path) !== c.path) {
+    p = p.split('/').map((s) => (looksGenerated(s) ? '«hidden»' : s)).join('/');
+    if (p === c.path) p = maskSecrets(c.path);
+    // a token split by slashes beside one masked on its own still shows when what is left is read whole
+    else if (maskSecrets(p) !== p) p = maskSecrets(p);
+  }
+  unmatchedCalls.push({ from: f.path, method: c.method, path: p, line: c.line, ...(c.host ? { host: c.host } : {}), ...(p !== c.path ? { hidden: true } : {}), ...(reached.has(c) ? { loose: true } : {}) });
+}
 
 // ---------- 5. write scan.json ----------
 // config files too big to be real ones (a tsconfig.json padded to megabytes) are noted, not read
@@ -223,6 +245,7 @@ const scan = {
   routes,
   http,
   hosts,
+  unmatchedCalls,
 };
 fs.mkdirSync(path.dirname(outFile), { recursive: true });
 fs.writeFileSync(outFile, JSON.stringify(scan));
@@ -394,6 +417,14 @@ for (const h of hosts) hostCounts.set(h.host, (hostCounts.get(h.host) || 0) + 1)
 if (hostCounts.size) {
   line(`EXTERNAL HOSTS called from code`);
   line('  ' + [...hostCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20).map(([h, c]) => `${h}(${c})`).join('  '));
+}
+const unanswered = unmatchedCalls.filter((c) => !c.loose);
+if (unanswered.length) {
+  const byDir = new Map();
+  for (const c of unanswered) { const d = c.from.split('/').slice(0, -1).join('/') || '.'; byDir.set(d, (byDir.get(d) || 0) + 1); }
+  const full = unanswered.filter((c) => c.host).length;
+  line(`RETROFIT REQUESTS NO SCANNED ROUTE ANSWERS  ${unanswered.length}, by folder (an http edge from that code to an external node lists them as its endpoints${full ? `; the ${full} written with a full address are not compared with the scanned routes, and are listed by the external node whose hosts name that address's host` : ''})`);
+  for (const [d, n] of [...byDir.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)) line(`  ${String(n).padStart(5)}  ${d}`);
 }
 line();
 const big = code.filter((f) => f.loc > 1500).sort((a, b) => b.loc - a.loc).slice(0, 10);

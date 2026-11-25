@@ -994,8 +994,75 @@ function extractJvm(src) {
     if (m[1] === 'Request' && m[2] === classPrefix) continue;
     routes.push({ method: m[1] === 'Request' ? 'ANY' : m[1].toUpperCase(), path: classPrefix + m[2], var: null, line: at(m.index) });
   }
-  const { calls, hosts } = extractCalls(code, at, { skip: /@\w+Mapping/ });
+  // in a Retrofit file the request annotations are read by retrofitCalls and blanked for the generic reading of the rest
+  // (Ktorfit and others keep the generic reading)
+  const retrofit = /^[ \t]*import\s+retrofit2\./m.test(code) ? retrofitCalls(code, at) : null;
+  const { calls, hosts } = extractCalls(retrofit ? retrofit.rest : code, at, { skip: /@\w+Mapping/ });
+  if (retrofit) {
+    // an address on an annotation's line that retrofitCalls couldn't read (joined from strings) is that request's own
+    const restLines = retrofit.rest.split('\n');
+    for (const h of hosts) if (RETROFIT_ANNOTATION.test(restLines[h.line - 1] || '')) h.retrofit = true;
+    calls.push(...retrofit.calls);
+    hosts.push(...retrofit.hosts);
+  }
   return { imports, symbols, routes, mounts: [], calls, hosts, pkg, ...(pkg ? { decls, mentions: jvmMentions(code) } : {}) };
+}
+
+/**
+ * Retrofit requests: @GET("users/{id}") or @HTTP(method = "DELETE", path = "users/{id}") on an interface method.
+ * A path without a leading slash is added to the client's base URL, so it is kept as written.
+ * Returns the requests, the hosts of full addresses (marked `retrofit`), and the code with each annotation read blanked.
+ */
+const RETROFIT_ANNOTATION = /@(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|HTTP)\s*\(/;
+function retrofitCalls(code, at) {
+  const VERB = /@(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s*\(\s*(?:value\s*=\s*)?"([^"\n]*)"\s*\)/g;
+  // across lines, as formatters split it, and at most 500 characters, so an @HTTP( never closed doesn't read on to the end of the file
+  const CUSTOM = /@HTTP\s*\(([^)]{0,500})\)/g;
+  const found = [];
+  for (const m of code.matchAll(VERB)) found.push({ method: m[1], raw: m[2], index: m.index, end: m.index + m[0].length });
+  for (const m of code.matchAll(CUSTOM)) {
+    const method = /\bmethod\s*=\s*"(\w+)"/.exec(m[1])?.[1];
+    const raw = /\bpath\s*=\s*"([^"]*)"/.exec(m[1])?.[1];
+    if (method && raw !== undefined) found.push({ method: method.toUpperCase(), raw, index: m.index, end: m.index + m[0].length });
+  }
+  // the call reader drops file names (feed.xml) and paths with no word in them (v1, {username}) to tell requests from
+  // other strings, and an annotation is always a request, unless it holds only interpolations, dots and slashes
+  const requestPath = (raw) => {
+    const p = raw.split(/[?#]/)[0];
+    return /^[\w\-.~%/*${}:@<>\[\]]*$/.test(p) && !/^[./]*$/.test(p.replace(/\$\{[^}]*\}/g, '')) ? p : null;
+  };
+  const calls = [], hosts = [];
+  for (const { method, raw, index } of found) {
+    const line = at(index);
+    const relative = !/^(?:https?:\/\/|\/)/i.test(raw);
+    const n = normalizeCallLiteral(relative ? '/' + raw : raw);
+    // a full address normalizeCallLiteral drops (a file name) or keeps without a path (no word in it) is read from the address itself
+    const addr = /^https?:\/\/([^/?#\s${}]+)(?=[/?#]|$)(\/[^?#]*)?/i.exec(raw);
+    const full = /^https?:\/\//i.test(raw);
+    // a Firebase function's address is this app's own backend, read as a request with no host
+    const own = full && n && !n.host;
+    // a host built at run time (api.${Cfg.DOMAIN}) is not read, so neither is its request
+    if (full && !own && !addr) continue;
+    const host = full && !own ? addr[1].toLowerCase() : null;
+    if (host) {
+      if (IGNORED_HOST.test(host)) continue;
+      hosts.push({ host, line, retrofit: true });
+      // a full address in the annotation replaces the base URL, so the request goes to that host
+      const p = n?.path || (addr?.[2] && requestPath(addr[2]));
+      if (p) calls.push({ path: p, method, line, retrofit: true, host });
+      continue;
+    }
+    if (n?.path) { calls.push({ path: relative ? n.path.slice(1) : n.path, method, line, retrofit: true, ...(own ? { firebase: true } : {}) }); continue; }
+    const p = !/^https?:\/\//i.test(raw) && requestPath(raw);
+    if (p) calls.push({ path: p, method, line, retrofit: true });
+  }
+  let rest = '', from = 0;
+  for (const { index, end } of found.sort((a, b) => a.index - b.index)) {
+    if (index < from) continue;
+    rest += code.slice(from, index) + code.slice(index, end).replace(/[^\n]/g, ' ');
+    from = end;
+  }
+  return { calls, hosts, rest: rest + code.slice(from) };
 }
 
 // ---------- C# / ASP.NET Core ----------

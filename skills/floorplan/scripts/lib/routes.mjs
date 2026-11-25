@@ -395,9 +395,12 @@ function score(c, r) {
  * Match call literals against resolved routes.
  * Ties are broken by the caller's learned base prefix: if a client's unambiguous calls all land
  * under /api/store, its ambiguous `/orders` means /api/store/orders, not /api/admin/orders.
+ * `reached`, when given, maps every call some route fits to whether it was linked: false for the ones
+ * left out below (thin evidence, or too many files to choose from), true for the rest, a repeat of a
+ * link already kept included.
  * @returns [{ from, to, method, path, call, line }]
  */
-export function matchCalls(files, routes) {
+export function matchCalls(files, routes, reached) {
   // ASP.NET Core matches paths ignoring case, so /api/Orders answers a call to /api/orders
   const rs = routes.map((r) => ({ ...r, segs: routeSegments(r.caseInsensitive ? r.path.toLowerCase() : r.path) }));
   const pending = [];
@@ -406,6 +409,7 @@ export function matchCalls(files, routes) {
   const scope = clientScope(files);
   for (const f of files) {
     for (const call of f.calls || []) {
+      if (call.host) continue; // a Retrofit request written with a full address goes on its host's edge, never to a route
       const cs = routeSegments(call.path);
       const csLower = routeSegments(call.path.toLowerCase());
       let best = -Infinity, hits = [];
@@ -421,6 +425,7 @@ export function matchCalls(files, routes) {
         if (sc.s > best) { best = sc.s; hits = [{ r, ...sc }]; } else if (sc.s === best) hits.push({ r, ...sc });
       }
       if (!hits.length) continue;
+      reached?.set(call, false);
       // as much evidence as the best match, whatever the length: /tasks/:id could be /tasks/{task} or /api/v2/tasks/{task}
       const alts = hits[0].weak ? [] : all.filter((h) => h.literal === hits[0].literal);
       pending.push({ f, call, hits, alts });
@@ -457,6 +462,7 @@ export function matchCalls(files, routes) {
       if (narrowed.length) keep = narrowed;
     }
     if (new Set(keep.map((h) => h.r.file)).size > 3) continue;
+    reached?.set(call, true);
     for (const { r } of keep) out.push({ from: f.path, to: r.file, method: r.method, path: r.path, call: call.path, line: call.line, routeLine: r.line });
   }
   return dedupe(out, (e) => `${e.from}|${e.to}|${e.method}|${e.path}`);

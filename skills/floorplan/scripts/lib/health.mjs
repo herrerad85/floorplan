@@ -314,7 +314,7 @@ const RANDOM_LOOKING = /(["'`])([A-Za-z0-9+/=_\-]{32,1000})\1/g;
 const BARE_RANDOM = /(?<![A-Za-z0-9+/=_\-])[A-Za-z0-9+/_\-]{32,1000}={0,2}(?![A-Za-z0-9+/=_\-])/g;
 const count = (s, re) => (s.match(re) || []).length;
 // generated: upper and lower case letters and digits all through it, not words (CamelCase names, paths) or a year
-const looksGenerated = (v) => count(v, /\d+/g) >= 3 && count(v, /\d/g) >= 4 && count(v, /[A-Z]/g) >= 4 && count(v, /[a-z]/g) >= 4
+export const looksGenerated = (v) => count(v, /\d+/g) >= 3 && count(v, /\d/g) >= 4 && count(v, /[A-Z]/g) >= 4 && count(v, /[a-z]/g) >= 4
   && count(v, /[A-Z][a-z]{3,}/g) < 3 && entropy(v) >= 4;
 export function maskSecrets(src, file) {
   const prose = !file || typeof file !== 'object';

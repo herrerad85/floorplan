@@ -279,10 +279,17 @@ for (const e of scan.extEdges) {
   const m = pkgMatchers.find((pm) => pm.globs.some((g) => g.test(e.pkg)));
   if (m) { m.hits++; addLink(`f:${e.from}`, `n:${m.id}`, 'import', { w: e.count, names: [e.pkg.split(':')[1]] }); }
 }
+const outsideEdges = new Map(); // source id -> keys of its http links to external nodes, or 'own' for one to a part of the project
+const addOutside = (map, id, key) => { const list = map.get(id) || []; if (!list.includes(key)) map.set(id, [...list, key]); };
 for (const h of scan.hosts) {
   if (!includedSet.has(h.from)) continue;
   const m = hostMatchers.find((hm) => hm.globs.some((g) => g.test(h.host)));
-  if (m) { m.hits++; addLink(`f:${h.from}`, `n:${m.id}`, 'http', { label: h.host, inferred: true }); }
+  if (!m) continue;
+  m.hits++;
+  addLink(`f:${h.from}`, `n:${m.id}`, 'http', { label: h.host, inferred: true });
+  // an address written in a Retrofit request's annotation is that request's own, not one the file's other requests go to
+  if (h.retrofit) continue;
+  addOutside(outsideEdges, `f:${h.from}`, byId.get(m.id)?.kind === 'external' ? `f:${h.from}|n:${m.id}|http` : 'own');
 }
 for (const pm of pkgMatchers) if (!pm.hits) warn(`node "${pm.id}" packages match nothing imported. Known: ${extIds.slice(0, 8).join(', ')}…`);
 for (const hm of hostMatchers) if (!hm.hits) warn(`node "${hm.id}" hosts match no host called from code`);
@@ -300,7 +307,47 @@ archEdges.forEach((e, i) => {
   const a = resolveEndpoint(e?.from, `${where}.from`);
   const b = resolveEndpoint(e?.to, `${where}.to`);
   if (a && b && EDGE_KINDS.includes(e.kind)) addLink(a, b, e.kind, { label: e.label, desc: e.description, w: 1 });
+  if (a && b && a !== b && e.kind === 'http') addOutside(outsideEdges, a, b.startsWith('n:') && byId.get(b.slice(2))?.kind === 'external' ? `${a}|${b}|http` : 'own');
 });
+
+// Each Retrofit request no scanned route answers goes on the http edge to an outside service from the nearest code that
+// makes it: its file, else the node holding the file, else the nodes above that. Code with http edges to several servers
+// gets none of its requests listed, since nothing says which server each one goes to, and requests from code whose edge
+// goes to a part of the project are counted and not listed.
+// A request a project route fits only loosely is counted, not listed. One entry per endpoint and file, or per line when
+// its path was masked, since two masked paths can hide different secrets.
+const OUTSIDE_CAP = 400;
+const outsideCount = { listed: 0, capped: 0, several: 0, none: 0, unhosted: 0, own: 0, loose: 0 };
+{
+  const seen = new Set();
+  for (const c of scan.unmatchedCalls || []) {
+    if (!includedSet.has(c.from)) continue;
+    const key = `${c.method}|${c.path}|${c.from}|${c.host || ''}${c.hidden ? `|${c.line}` : ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    if (c.loose) { outsideCount.loose++; continue; }
+    let edges;
+    if (c.host) {
+      // a request written with its full address goes only on the edge read from that address in its own file
+      const m = hostMatchers.find((hm) => hm.globs.some((g) => g.test(c.host)));
+      if (!m) { outsideCount.unhosted++; continue; }
+      if (byId.get(m.id)?.kind !== 'external') { outsideCount.own++; continue; }
+      edges = [`f:${c.from}|n:${m.id}|http`];
+    } else {
+      edges = outsideEdges.get(`f:${c.from}`);
+      for (let n = owner.get(c.from), i = 0; !edges && n && i < 50; n = byId.get(n)?.parent, i++) edges = outsideEdges.get(`n:${n}`);
+    }
+    if (!edges) { outsideCount.none++; continue; }
+    if (edges.length > 1) { outsideCount.several++; continue; }
+    if (edges[0] === 'own') { outsideCount.own++; continue; }
+    const l = links.get(edges[0]);
+    l.out = l.out || [];
+    if (l.out.length >= OUTSIDE_CAP) { outsideCount.capped++; continue; }
+    l.out.push([c.method, c.path, c.from, c.line]);
+    if (c.hidden) hiddenSecrets.push({ file: c.from, field: `request on line ${c.line}` });
+    outsideCount.listed++;
+  }
+}
 
 // ---------- flows + annotations ----------
 const outFlows = [];
@@ -512,6 +559,18 @@ const byKind = {};
 for (const l of links.values()) byKind[l.k] = (byKind[l.k] || 0) + 1;
 if (leftOut.line) report.push(leftOut.line);
 report.push(`LINKS  ${[...links.values()].length} (${Object.entries(byKind).map(([k, v]) => `${k} ${v}`).join(', ')})`);
+{
+  const { listed, capped, several, none, unhosted, own, loose } = outsideCount;
+  if (listed + capped + several + none + unhosted + own + loose) report.push(`OUTSIDE CALLS  ${listed} Retrofit requests on http edges to outside services`
+    + (capped ? ` · ${capped} left off edges that already list ${OUTSIDE_CAP}` : '')
+    + (several ? ` · ${several} from code with http edges to more than one server, so none is listed; draw the edge from the files that make each server's calls` : '')
+    + (none ? ` · ${none} more no scanned route answers; an http edge from that code to its external node lists them` : '')
+    + (unhosted ? ` · ${unhosted} written with a full address whose host is in no node's hosts; add it to its external node's hosts to list them there, or to the hosts of the project node whose server answers it` : '')
+    + (own ? ` · ${own} going to a part of the project, by a full address whose host it names or from code whose http edge goes to it, not listed` : '')
+    + (loose ? ` · ${loose} that a scanned endpoint fits only loosely, on no edge` : ''));
+  // which edge took them, so an edge drawn for something else that collected a part's requests shows here
+  for (const l of [...links.values()].filter((x) => x.out?.length).sort((x, y) => y.out.length - x.out.length).slice(0, 12)) report.push(`  ${String(l.out.length).padStart(5)}  ${l.a.slice(2)} → ${l.b.slice(2)}`);
+}
 const describedFiles = included.filter((f) => fileDesc.get(f.path)?.d || f.desc).length;
 const describedRoutes = routesIn.filter((r) => routeDesc.get(routeKey(r))?.d || r.desc).length;
 const noSummary = nodes.filter((n) => n?.id && !isStr(n.summary)).map((n) => n.id);

@@ -35,7 +35,7 @@ Each node is a chip on the board. Hierarchy comes from `parent`. A node with no 
 | `paths` | string[] | globs claiming files (see below) |
 | `exclude` | string[] | globs to carve files back out of `paths`. **Inherited by all descendants**, e.g. `"exclude": ["**/*.test.tsx"]` on a frontend node keeps co-located tests out of every child, so a separate Tests node can claim them |
 | `packages` | string[] | **external nodes:** package names this node stands for, e.g. `"stripe"`, `"npm:@stripe/*"`, `"pypi:sqlalchemy"`. Imports of them become edges to this node |
-| `hosts` | string[] | **external nodes:** hostnames called from code, e.g. `"api.stripe.com"`, `"*.squareup.com"`. Calls become `http` edges |
+| `hosts` | string[] | **external nodes:** hostnames called from code, e.g. `"api.stripe.com"`, `"*.squareup.com"`. Calls become `http` edges. A project node whose server the code calls by full address can take its host too |
 | `tags` | string[] | free-form, shown in the panel |
 
 Kinds, briefly:
@@ -85,6 +85,7 @@ Good candidates:
 - cron/scheduler → job (`call`)
 - Firebase background functions (schedules, Firestore/Storage/Pub/Sub triggers, from the scan's FIREBASE FUNCTIONS list) → a `worker` node; link the collection or topic that triggers them (`event`)
 - calls through env-configured base URLs that the matcher missed (`http`)
+- Retrofit requests to a server outside the scanned code, which the scan summary counts under RETROFIT REQUESTS NO SCANNED ROUTE ANSWERS (`http`, from the node or file that makes them to the external node). The edge lists the requests that code makes as that service's endpoints, shown on the service's panel. Each request goes on the edge of the nearest file or node that has one, and code with an edge to a part of the project, or with edges to more than one server, lists none, so when one part calls several, draw each edge from the files that call it. The edge the build draws from a service's address found in a file (the external node's `hosts`) lists that file's requests, unless the address is written in a request's annotation. A request written with a full address goes only on the edge for its host, so it is listed only when an external node's `hosts` names that host
 
 ## annotations
 
